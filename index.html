@@ -1,0 +1,597 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>CFP MRP — Metrics Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <!-- Tailwind (utility styles) -->
+  <script src="https://cdn.tailwindcss.com" defer></script>
+  <!-- React 18 UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js" defer></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" defer></script>
+  <!-- Supabase JS v2 (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js" defer></script>
+  <style>
+    html, body { background:#0b1220; color:#e5e7eb; }
+    .card { background:#111827; border:1px solid #1f2937; }
+    .chip { border-radius:999px; padding:0.1rem 0.5rem; font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em; }
+    .chip-active { background:rgba(56,189,248,0.1); color:#38bdf8; border:1px solid rgba(56,189,248,0.4); }
+    .chip-complete { background:rgba(34,197,94,0.1); color:#4ade80; border:1px solid rgba(34,197,94,0.4); }
+    .chip-overdue { background:rgba(248,113,113,0.1); color:#fca5a5; border:1px solid rgba(248,113,113,0.4); }
+    .chip-idle { background:rgba(234,179,8,0.1); color:#facc15; border:1px solid rgba(234,179,8,0.4); }
+    .pill { border-radius:999px; padding:0.15rem 0.55rem; font-size:0.7rem; border:1px solid rgba(148,163,184,0.4); }
+    @media print {
+      .no-print { display:none !important; }
+      html, body { background:#fff; color:#111827; }
+      .card { background:#fff; border-color:#e5e7eb; }
+      a { color:#111827 !important; text-decoration:none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root" class="p-4 md:p-6">Loading…</div>
+
+<script>
+window.addEventListener('DOMContentLoaded', function(){
+(function(){
+  const e = React.createElement;
+  const { useState, useEffect, useMemo } = React;
+
+  /* ===================== Config ===================== */
+  const DEFAULTS = (function(){
+    try { return JSON.parse(localStorage.getItem('erp_supabase_cfg') || '{}'); }
+    catch { return {}; }
+  })();
+  const DEFAULT_SUPABASE_URL  = DEFAULTS.url  || "https://zwlfifwxjuvsgnjplszs.supabase.co";
+  const DEFAULT_SUPABASE_ANON = DEFAULTS.anon || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp3bGZpZnd4anV2c2duanBsc3pzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTYxNTIxMzIsImV4cCI6MjA3MTcyODEzMn0.TRW8_2Ps767A4DE7Zp5sxFGmNCshH0qHU0WLRPBUeNQ";
+  const DEFAULT_ORG_ID        = DEFAULTS.org  || "21975033-1a9e-4bc9-96a8-e941fb1076a3";
+
+  function makeSb(){
+    if (!DEFAULT_SUPABASE_URL || !DEFAULT_SUPABASE_ANON) return null;
+    try {
+      return window.supabase.createClient(DEFAULT_SUPABASE_URL, DEFAULT_SUPABASE_ANON, { auth:{ persistSession:false } });
+    } catch(e){
+      console.error("Supabase init failed", e);
+      return null;
+    }
+  }
+  const sb = makeSb();
+
+  /* ===================== Utilities ===================== */
+  function batched(fn, items, size){
+    const out = [];
+    const n = size || 60;
+    return (async function(){
+      for (let i=0;i<items.length;i+=n){
+        const chunk = items.slice(i, i+n);
+        // eslint-disable-next-line no-await-in-loop
+        const res = await fn(chunk);
+        if (Array.isArray(res)) out.push.apply(out, res);
+      }
+      return out;
+    })();
+  }
+
+  function isOpComplete(op){
+    return !!(op && (op.is_done === true || op.qa_is_done === true || op.done_at || op.qa_done_at));
+  }
+
+  function opHours(op){
+    const setup = Number(op.setup_mins || 0);
+    const runpc = Number(op.run_mins_per_pc || 0);
+    const qty   = Number(op.qty_this_op || 0);
+    const legacy = Number(op.hours || 0);
+    const derived = (setup + runpc * qty) / 60;
+    if (setup || runpc || qty) return Number(derived.toFixed(2));
+    return Number(legacy.toFixed ? legacy.toFixed(2) : legacy);
+  }
+
+  function daysBetween(a, b){
+    if (!a || !b) return null;
+    const ms = b.getTime() - a.getTime();
+    return Math.round(ms / 86400000);
+  }
+
+  function parseDate(d){
+    if (!d) return null;
+    const dt = new Date(d);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+
+  function fmtDate(d){
+    if (!d) return "";
+    return d.toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" });
+  }
+
+  function fmtPct(x){
+    if (!isFinite(x)) return "0%";
+    return x.toFixed(0) + "%";
+  }
+
+  function fmtHours(h){
+    if (h == null || isNaN(h)) return "0.0";
+    return h.toFixed(1);
+  }
+
+  /* ===================== Data Fetch ===================== */
+  async function fetchJobs(client, orgId){
+    const { data, error } = await client
+      .from("jobs")
+      .select("id, job_number, customer, description, due_date, created_at, updated_at")
+      .eq("org_id", orgId);
+    if (error) throw error;
+    return data || [];
+  }
+
+  async function fetchPartsForJobs(client, orgId, jobIds){
+    if (!jobIds.length) return [];
+    return batched(async function(ids){
+      let q = client.from("parts").select("id, job_id").in("job_id", ids);
+      if (orgId) q = q.eq("org_id", orgId);
+      const { data, error } = await q;
+      if (error) throw error;
+      return data || [];
+    }, jobIds, 60);
+  }
+
+  async function fetchOpsForParts(client, orgId, partIds){
+    if (!partIds.length) return [];
+    return batched(async function(ids){
+      let q = client.from("operations")
+        .select("id, part_id, seq, name, machine, hours, setup_mins, run_mins_per_pc, qty_this_op, note, qa_note, next_part, assigned_to, is_done, done_at, qa_is_done, qa_done_at, start_at, updated_at, signed_off_by, signed_off_at");
+      q = q.in("part_id", ids);
+      if (orgId) q = q.eq("org_id", orgId);
+      const { data, error } = await q;
+      if (error) throw error;
+      return data || [];
+    }, partIds, 60);
+  }
+
+  /* ===================== Metrics Computation ===================== */
+  function computeJobMetrics(jobs, parts, ops){
+    const partsByJob = {};
+    parts.forEach(p => {
+      (partsByJob[p.job_id] || (partsByJob[p.job_id] = [])).push(p);
+    });
+    const opsByPart = {};
+    ops.forEach(o => {
+      (opsByPart[o.part_id] || (opsByPart[o.part_id] = [])).push(o);
+    });
+
+    const now = new Date();
+    const rows = [];
+
+    jobs.forEach(job => {
+      const jobParts = partsByJob[job.id] || [];
+      const allOps = [];
+      jobParts.forEach(p => {
+        (opsByPart[p.id] || []).forEach(o => allOps.push(o));
+      });
+      const partsCount = jobParts.length;
+      const opsCount = allOps.length;
+
+      let doneOps = 0;
+      let totalHrs = 0;
+      let doneHrs = 0;
+      let lastActivity = parseDate(job.updated_at) || parseDate(job.created_at);
+      let firstOpStart = null;
+      let lastDoneAt = null;
+
+      allOps.forEach(op => {
+        const h = opHours(op);
+        totalHrs += h;
+        if (isOpComplete(op)){
+          doneOps += 1;
+          doneHrs += h;
+          const d = parseDate(op.done_at || op.qa_done_at || op.updated_at);
+          if (d && (!lastDoneAt || d > lastDoneAt)) lastDoneAt = d;
+        }
+        const upd = parseDate(op.updated_at || op.start_at);
+        if (upd && (!lastActivity || upd > lastActivity)) lastActivity = upd;
+        const st = parseDate(op.start_at);
+        if (st && (!firstOpStart || st < firstOpStart)) firstOpStart = st;
+      });
+
+      const completionPct = opsCount ? (doneOps / opsCount * 100) : 0;
+      const remainingHrs = totalHrs - doneHrs;
+      const createdAt = parseDate(job.created_at);
+      const dueDate = parseDate(job.due_date);
+
+      const isCompleted = opsCount > 0 && doneOps === opsCount;
+      const isOverdue = !isCompleted && dueDate && dueDate < now;
+      const ageDays = createdAt ? daysBetween(createdAt, isCompleted && lastDoneAt ? lastDoneAt : now) : null;
+      const daysToDue = dueDate ? daysBetween(now, dueDate) : null;
+
+      rows.push({
+        id: job.id,
+        job_number: job.job_number,
+        customer: job.customer,
+        description: job.description,
+        createdAt,
+        dueDate,
+        lastActivity,
+        firstOpStart,
+        partsCount,
+        opsCount,
+        doneOps,
+        completionPct,
+        totalHrs,
+        doneHrs,
+        remainingHrs,
+        isCompleted,
+        isOverdue,
+        ageDays,
+        daysToDue,
+        rawJob: job
+      });
+    });
+
+    return rows;
+  }
+
+
+  function computeMachineMetrics(ops){
+    const now = new Date();
+    const cutoffWeek = new Date(now.getTime() - 7 * 86400000); // last 7 days
+    const byMachine = {};
+    ops.forEach(function(op){
+      const mach = op.machine || "Unassigned";
+      const bucket = (byMachine[mach] || (byMachine[mach] = {
+        machine: mach,
+        totalHrs: 0,
+        remainingHrs: 0,
+        doneHrs: 0,
+        weeklyDoneHrs: 0,
+        weeklyOpsCompleted: 0,
+        totalOps: 0,
+        openOps: 0
+      }));
+      const h = opHours(op);
+      const isDone = isOpComplete(op);
+      const doneAt = parseDate(op.done_at || op.qa_done_at);
+      bucket.totalOps += 1;
+      bucket.totalHrs += h;
+      if (isDone){
+        bucket.doneHrs += h;
+        if (doneAt && doneAt >= cutoffWeek){
+          bucket.weeklyDoneHrs += h;
+          bucket.weeklyOpsCompleted += 1;
+        }
+      } else {
+        bucket.openOps += 1;
+        bucket.remainingHrs += h;
+      }
+    });
+    return Object.values(byMachine).sort(function(a,b){
+      return a.machine.localeCompare(b.machine);
+    });
+  }
+
+  /* ===================== Components ===================== */
+  function StatCard(props){
+    return e("div", { className:"card rounded-xl p-4 flex flex-col gap-1" },
+      e("div", { className:"text-xs uppercase tracking-wide text-slate-400" }, props.label),
+      e("div", { className:"text-2xl font-semibold" }, props.value),
+      props.sub && e("div", { className:"text-xs text-slate-400" }, props.sub)
+    );
+  }
+
+  function StatusChip({ row }){
+    let cls = "chip ";
+    let text = "Unknown";
+    if (row.isCompleted){
+      cls += "chip-complete";
+      text = "Completed";
+    } else {
+      cls += "chip-active";
+      text = "Active";
+    }
+    if (row.isOverdue){
+      cls = "chip chip-overdue";
+      text = "Overdue";
+    }
+    return e("span", { className:cls }, text);
+  }
+
+  function JobRow({ row, onToggleOpen, open }){
+    const subtitleParts = [];
+    if (row.customer) subtitleParts.push(row.customer);
+    if (row.description) subtitleParts.push(row.description);
+    const subtitle = subtitleParts.join(" • ");
+
+    const dueLabel = row.dueDate ? fmtDate(row.dueDate) : "—";
+    let dueBadge = null;
+    if (row.daysToDue != null){
+      if (row.daysToDue < 0){
+        dueBadge = e("span", { className:"pill text-rose-300 border-rose-500/40" }, Math.abs(row.daysToDue) + " days late");
+      } else if (row.daysToDue <= 3){
+        dueBadge = e("span", { className:"pill text-amber-300 border-amber-500/40" }, row.daysToDue + " days to due");
+      } else {
+        dueBadge = e("span", { className:"pill text-slate-300" }, row.daysToDue + " days to due");
+      }
+    }
+
+    return e("div", { className:"card rounded-xl p-3 md:p-4 flex flex-col gap-3" },
+      e("div", { className:"flex flex-col md:flex-row md:items-center md:justify-between gap-2" },
+        e("div", null,
+          e("div", { className:"flex items-center gap-2" },
+            e("button", {
+              className:"text-left font-semibold hover:text-sky-300",
+              onClick:onToggleOpen
+            }, row.job_number || "(no job #)"),
+            e(StatusChip, { row: row })
+          ),
+          subtitle && e("div", { className:"text-xs text-slate-400 mt-0.5" }, subtitle)
+        ),
+        e("div", { className:"flex flex-wrap gap-2 text-xs md:justify-end" },
+          e("div", { className:"flex flex-col items-end" },
+            e("span", { className:"text-slate-400" }, "Completion"),
+            e("span", { className:"font-semibold" }, fmtPct(row.completionPct))
+          ),
+          e("div", { className:"flex flex-col items-end" },
+            e("span", { className:"text-slate-400" }, "Est. Hours"),
+            e("span", { className:"font-semibold" }, fmtHours(row.doneHrs) + " / " + fmtHours(row.totalHrs))
+          ),
+          e("div", { className:"flex flex-col items-end" },
+            e("span", { className:"text-slate-400" }, "Parts / Ops"),
+            e("span", { className:"font-semibold" }, row.partsCount + " / " + row.opsCount)
+          )
+        )
+      ),
+      e("div", { className:"grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] text-slate-400" },
+        e("div", null,
+          e("div", null, "Created"),
+          e("div", { className:"text-slate-200" }, row.createdAt ? fmtDate(row.createdAt) : "—")
+        ),
+        e("div", null,
+          e("div", null, "Due"),
+          e("div", { className:"flex items-center gap-2 text-slate-200" },
+            dueLabel,
+            dueBadge
+          )
+        ),
+        e("div", null,
+          e("div", null, "Last Activity"),
+          e("div", { className:"text-slate-200" }, row.lastActivity ? fmtDate(row.lastActivity) : "—")
+        ),
+        e("div", null,
+          e("div", null, "Age (days)"),
+          e("div", { className:"text-slate-200" }, row.ageDays != null ? row.ageDays : "—")
+        )
+      ),
+      open && e("div", { className:"border-t border-slate-700 pt-3 mt-1 text-[11px] text-slate-300" },
+        e("div", { className:"font-semibold mb-1" }, "Metrics Snapshot"),
+        e("ul", { className:"list-disc ml-4 space-y-1" },
+          e("li", null, "Operations complete: ", row.doneOps, " of ", row.opsCount, " (", fmtPct(row.completionPct), ")"),
+          e("li", null, "Estimated remaining hours: ", fmtHours(row.remainingHrs)),
+          e("li", null, "First operation start: ", row.firstOpStart ? fmtDate(row.firstOpStart) : "—"),
+          e("li", null, "Last activity (job or op): ", row.lastActivity ? fmtDate(row.lastActivity) : "—")
+        )
+      )
+    );
+  }
+
+  function App(){
+    const [rows, setRows] = useState([]);
+    const [machineMetrics, setMachineMetrics] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState("");
+    const [statusFilter, setStatusFilter] = useState("active"); // all | active | completed | overdue
+    const [search, setSearch] = useState("");
+    const [openId, setOpenId] = useState(null);
+
+    useEffect(function(){
+      if (!sb || !DEFAULT_ORG_ID){
+        setError("Missing Supabase config. Open any existing CFP MRP app Settings and save URL/key/org.");
+        return;
+      }
+      async function load(){
+        setLoading(true);
+        setError("");
+        try{
+          const jobs = await fetchJobs(sb, DEFAULT_ORG_ID);
+          const parts = await fetchPartsForJobs(sb, DEFAULT_ORG_ID, jobs.map(j => j.id));
+          const ops   = await fetchOpsForParts(sb, DEFAULT_ORG_ID, parts.map(p => p.id));
+          const metrics = computeJobMetrics(jobs, parts, ops);
+          const machines = computeMachineMetrics(ops);
+          setRows(metrics);
+          setMachineMetrics(machines);
+        }catch(e){
+          console.error(e);
+          setError((e && (e.message || String(e))) || "Failed to load data");
+        }finally{
+          setLoading(false);
+        }
+      }
+      load();
+    }, []);
+
+    const filtered = useMemo(function(){
+      const q = (search || "").toLowerCase();
+      return rows.filter(function(r){
+        if (statusFilter === "active" && r.isCompleted) return false;
+        if (statusFilter === "completed" && !r.isCompleted) return false;
+        if (statusFilter === "overdue" && !r.isOverdue) return false;
+        if (q){
+          const hay = ((r.job_number || "") + " " + (r.customer || "") + " " + (r.description || "")).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      }).sort(function(a,b){
+        // sort by due date asc, then job #
+        const ad = a.dueDate ? a.dueDate.getTime() : Infinity;
+        const bd = b.dueDate ? b.dueDate.getTime() : Infinity;
+        if (ad !== bd) return ad - bd;
+        return (a.job_number || "").localeCompare(b.job_number || "");
+      });
+    }, [rows, statusFilter, search]);
+
+    const summary = useMemo(function(){
+      const totalJobs = rows.length;
+      let activeJobs = 0;
+      let completedJobs = 0;
+      let overdueJobs = 0;
+      let sumPctAll = 0;
+      let countedAll = 0;
+      let sumPctActive = 0;
+      let countedActive = 0;
+      let totalRemaining = 0;
+      let openOps = 0;
+
+      rows.forEach(function(r){
+        if (r.isCompleted) completedJobs++; else activeJobs++;
+        if (r.isOverdue) overdueJobs++;
+        if (isFinite(r.completionPct)){
+          sumPctAll += r.completionPct;
+          countedAll++;
+          if (!r.isCompleted) {
+            sumPctActive += r.completionPct;
+            countedActive++;
+          }
+        }
+        totalRemaining += Math.max(0, r.remainingHrs || 0);
+        openOps += Math.max(0, (r.opsCount || 0) - (r.doneOps || 0));
+      });
+
+      const avgPctAll = countedAll ? (sumPctAll / countedAll) : 0;
+      const avgPctActive = countedActive ? (sumPctActive / countedActive) : 0;
+
+      return {
+        totalJobs,
+        activeJobs,
+        completedJobs,
+        overdueJobs,
+        avgPctAll,
+        avgPctActive,
+        totalRemaining,
+        openOps
+      };
+    }, [rows]);
+
+    return e("div", { className:"max-w-6xl mx-auto space-y-4" },
+      e("div", { className:"flex flex-col md:flex-row md:items-center md:justify-between gap-3" },
+        e("div", null,
+          e("h1", { className:"text-2xl font-semibold tracking-tight" }, "CFP MRP — Metrics Dashboard"),
+          e("p", { className:"text-sm text-slate-400 mt-1" }, "Real-time overview of all jobs, operations, and hours (current and completed).")
+        ),
+        e("div", { className:"flex gap-2 items-center no-print" },
+          e("input", {
+            className:"bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-sky-500",
+            placeholder:"Search job, customer, description…",
+            value: search,
+            onChange: function(ev){ setSearch(ev.target.value); }
+          })
+        )
+      ),
+
+      e("div", { className:"grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-3" },
+        e(StatCard, { label:"Total Jobs", value: summary.totalJobs || 0, sub:"All jobs in this organization" }),
+        e(StatCard, { label:"Active Jobs", value: summary.activeJobs || 0, sub:"Jobs with work remaining" }),
+        e(StatCard, { label:"Completed Jobs", value: summary.completedJobs || 0, sub:"All operations complete" }),
+        e(StatCard, { label:"Overdue Jobs", value: summary.overdueJobs || 0, sub:"Past due and not complete" }),
+        e(StatCard, { label:"Avg Completion (All Jobs)", value: fmtPct(summary.avgPctAll || 0), sub:"Active + completed" }),
+        e(StatCard, { label:"Avg Completion (Active Jobs)", value: fmtPct(summary.avgPctActive || 0), sub:"Open jobs only" }),
+        e(StatCard, { label:"Remaining Hours", value: fmtHours(summary.totalRemaining || 0), sub:"Estimated to finish all active jobs" })
+      ),
+
+      e("div", { className:"flex flex-wrap items-center justify-between gap-2 mt-2 no-print" },
+        e("div", { className:"flex gap-2 text-xs" },
+          e("button", {
+            className:"chip " + (statusFilter === "active" ? "chip-active" : "border border-slate-600"),
+            onClick:function(){ setStatusFilter("active"); }
+          }, "Active"),
+          e("button", {
+            className:"chip " + (statusFilter === "completed" ? "chip-complete" : "border border-slate-600"),
+            onClick:function(){ setStatusFilter("completed"); }
+          }, "Completed"),
+          e("button", {
+            className:"chip " + (statusFilter === "overdue" ? "chip-overdue" : "border border-slate-600"),
+            onClick:function(){ setStatusFilter("overdue"); }
+          }, "Overdue"),
+          e("button", {
+            className:"chip border border-slate-600",
+            onClick:function(){ setStatusFilter("all"); }
+          }, "All")
+        ),
+        e("div", { className:"text-xs text-slate-500" },
+          "Open operations: ",
+          e("span", { className:"font-semibold text-slate-200" }, summary.openOps || 0)
+        )
+      ),
+
+      error && e("div", { className:"card rounded-lg p-3 text-sm text-rose-300 border border-rose-500/40" }, String(error)),
+      loading && e("div", { className:"text-sm text-slate-400" }, "Loading metrics…"),
+
+      !loading && !filtered.length && e("div", { className:"text-sm text-slate-500 mt-4" }, "No jobs match the current filters."),
+
+
+      machineMetrics && machineMetrics.length > 0 && e("div", { className:"mt-4 card rounded-xl p-4" },
+        e("div", { className:"flex items-center justify-between mb-3" },
+          e("div", null,
+            e("h2", { className:"text-sm font-semibold" }, "Machine Utilization & Productivity"),
+            e("p", { className:"text-xs text-slate-400" }, "Last 7 days · 36 productive hours per machine")
+          )
+        ),
+        e("div", { className:"overflow-x-auto" },
+          e("table", { className:"min-w-full text-xs" },
+            e("thead", { className:"text-slate-400 border-b border-slate-700" },
+              e("tr", null,
+                e("th", { className:"text-left py-1 pr-4" }, "Machine"),
+                e("th", { className:"text-right py-1 pr-4" }, "Weekly Utilization"),
+                e("th", { className:"text-right py-1 pr-4" }, "Hrs Completed (7d)"),
+                e("th", { className:"text-right py-1 pr-4" }, "Ops Completed (7d)"),
+                e("th", { className:"text-right py-1 pr-4" }, "Remaining Hrs (All Jobs)"),
+                e("th", { className:"text-right py-1 pr-0" }, "Open Ops")
+              )
+            ),
+            e("tbody", null,
+              machineMetrics.map(function(m){
+                const util = Math.min( (m.weeklyDoneHrs || 0) / 36 * 100, 999);
+                return e("tr", { key:m.machine, className:"border-b border-slate-800 last:border-0" },
+                  e("td", { className:"py-1 pr-4 text-slate-200" }, m.machine),
+                  e("td", { className:"py-1 pr-4 text-right" }, isFinite(util) ? util.toFixed(0) + "%" : "0%"),
+                  e("td", { className:"py-1 pr-4 text-right" }, fmtHours(m.weeklyDoneHrs || 0)),
+                  e("td", { className:"py-1 pr-4 text-right" }, m.weeklyOpsCompleted || 0),
+                  e("td", { className:"py-1 pr-4 text-right" }, fmtHours(m.remainingHrs || 0)),
+                  e("td", { className:"py-1 pr-0 text-right" }, m.openOps || 0)
+                );
+              })
+            )
+          )
+        )
+      ),
+      e("div", { className:"mt-3 space-y-3" },
+        filtered.map(function(r){
+          return e(JobRow, {
+            key: r.id,
+            row: r,
+            open: openId === r.id,
+            onToggleOpen: function(){
+              setOpenId(openId === r.id ? null : r.id);
+            }
+          });
+        })
+      )
+    );
+  }
+
+  (function boot(){
+    try{
+      const root = document.getElementById("root");
+      if (!window.React || !window.ReactDOM) {
+        root.textContent = "React failed to load — try refreshing or check your network connection.";
+        return;
+      }
+      ReactDOM.createRoot(root).render(e(App));
+    }catch(e){
+      const root = document.getElementById("root");
+      root.textContent = "Render error: " + (e && (e.message || String(e)));
+      console.error(e);
+    }
+  })();
+})();
+});
+</script>
+</body>
+</html>
